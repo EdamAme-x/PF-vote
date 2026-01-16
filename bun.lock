@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "PF-vote-by-YSNETS",
+      "name": "nue-",
       "dependencies": {
         "@hono/valibot-validator": "^0.6.1",
         "drizzle-kit": "^0.31.8",
