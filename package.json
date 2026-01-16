@@ -2,12 +2,14 @@
   "name": "nue-",
   "scripts": {
     "dev": "bun run --hot src/index.tsx",
-    "dbup":"drizzle-kit generate && bun run mg.ts"
+    "dbup": "drizzle-kit generate && bun run mg.ts",
+    "reset": "bun run src/reset.ts"
   },
   "dependencies": {
     "@hono/valibot-validator": "^0.6.1",
     "drizzle-kit": "^0.31.8",
     "drizzle-orm": "^0.45.1",
+    "drizzle-seed": "^0.3.1",
     "hono": "^4.11.4",
     "valibot": "^1.2.0"
   },

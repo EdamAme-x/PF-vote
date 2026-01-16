@@ -15,6 +15,7 @@ const cookieSecret = process.env.COOKIE_SECRET ||
   (() => {
     throw new Error("COOKIE_SECRET is not set");
   })();
+const oneDayMs = 24 * 60 * 60 * 1000;
 
 app.use(logger());
 app.use("/script.js", serveStatic({ path: "./src/script.js" }));
@@ -56,6 +57,26 @@ const buildServerFingerprint = (req: Request) => {
 // クライアント側フィンガープリントをハッシュ化
 const hashClientFingerprint = (clientFp: string) => {
   return createHash("sha256").update(clientFp).digest("hex");
+};
+
+const encodeServerFpCookie = (serverFp: string, createdAt: number) => {
+  return JSON.stringify({ serverFp, createdAt });
+};
+
+const decodeServerFpCookie = (value: string | null | undefined | false) => {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value);
+    if (
+      typeof parsed?.serverFp !== "string" ||
+      typeof parsed?.createdAt !== "number"
+    ) {
+      return null;
+    }
+    return parsed as { serverFp: string; createdAt: number };
+  } catch {
+    return null;
+  }
 };
 
 // ホームページ（UIとクライアント側スクリプト）
@@ -149,6 +170,7 @@ app.post("/init", async (c) => {
     }
 
     const serverFp = buildServerFingerprint(c.req.raw);
+    const serverFpCookieValue = encodeServerFpCookie(serverFp, Date.now());
     const hashedClientFp = hashClientFingerprint(clientFp);
 
     // 同じサーバーFPとクライアントFP両方の組み合わせが既に存在するかチェック
@@ -161,7 +183,7 @@ app.post("/init", async (c) => {
 
     if (existingUser.length > 0) {
       // 初期化済み：fingerプリントのみCookieに保存
-      await setSignedCookie(c, "serverFp", serverFp, cookieSecret, {
+      await setSignedCookie(c, "serverFp", serverFpCookieValue, cookieSecret, {
         maxAge: 24 * 60 * 60,
         secure: false,
         sameSite: "Lax",
@@ -179,7 +201,7 @@ app.post("/init", async (c) => {
     }
 
     // 新規ユーザー：fingerプリントのみCookieに保存
-    await setSignedCookie(c, "serverFp", serverFp, cookieSecret, {
+    await setSignedCookie(c, "serverFp", serverFpCookieValue, cookieSecret, {
       maxAge: 24 * 60 * 60,
       secure: false,
       sameSite: "Lax",
@@ -212,10 +234,14 @@ app.post("/vote", async (c) => {
     }
 
     // Cookieからフィンガープリントを取得
-    const cookieServerFp = await getSignedCookie(c, cookieSecret, "serverFp");
+    const cookieServerFpRaw = await getSignedCookie(
+      c,
+      cookieSecret,
+      "serverFp",
+    );
     const cookieClientFp = await getSignedCookie(c, cookieSecret, "clientFp");
 
-    console.log(cookieServerFp, cookieClientFp);
+    const cookieServerFp = decodeServerFpCookie(cookieServerFpRaw);
 
     if (!cookieServerFp || !cookieClientFp) {
       return c.json({ message: "未初期化です。先に初期化してください" }, 401);
@@ -223,7 +249,13 @@ app.post("/vote", async (c) => {
 
     // 現在のリクエストのサーバーFPと比較（同じIP/User-Agentなどか確認）
     const currentServerFp = buildServerFingerprint(c.req.raw);
-    if (currentServerFp !== cookieServerFp) {
+    if (Date.now() - cookieServerFp.createdAt > oneDayMs) {
+      return c.json(
+        { message: "初期化から1日以上経過しています。再初期化してください" },
+        403,
+      );
+    }
+    if (currentServerFp !== cookieServerFp.serverFp) {
       return c.json(
         { message: "異なる環境からのアクセスが検出されました" },
         403,
@@ -233,7 +265,7 @@ app.post("/vote", async (c) => {
     // DB内でフィンガープリントを使ってユーザーを検索
     const existingVote = await db.select().from(s.user).where(
       and(
-        eq(s.user.serverFingerprint, cookieServerFp),
+        eq(s.user.serverFingerprint, cookieServerFp.serverFp),
         eq(s.user.clientFingerprint, cookieClientFp),
       ),
     ).limit(1);
@@ -250,7 +282,7 @@ app.post("/vote", async (c) => {
         .set({ vote: voteOption })
         .where(
           and(
-            eq(s.user.serverFingerprint, cookieServerFp),
+            eq(s.user.serverFingerprint, cookieServerFp.serverFp),
             eq(s.user.clientFingerprint, cookieClientFp),
           ),
         );
@@ -259,7 +291,7 @@ app.post("/vote", async (c) => {
       const userId = crypto.randomUUID();
       await db.insert(s.user).values({
         id: userId,
-        serverFingerprint: cookieServerFp,
+        serverFingerprint: cookieServerFp.serverFp,
         clientFingerprint: cookieClientFp,
         vote: voteOption,
         createdAt: now,
