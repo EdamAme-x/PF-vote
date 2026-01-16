@@ -1,52 +1,65 @@
-import { Hono } from 'hono'
-import {jsxRenderer} from "hono/jsx-renderer"
-import { drizzle } from 'drizzle-orm/bun-sqlite';
-import { createHash } from "crypto"
-import * as s from "./schema"
-import {eq,and} from "drizzle-orm"
-import { getCookie, setCookie } from 'hono/cookie'
-import {logger} from "hono/logger"
-import { serveStatic } from 'hono/bun'
+import { Hono } from "hono";
+import { jsxRenderer } from "hono/jsx-renderer";
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { createHash } from "crypto";
+import * as s from "./schema";
+import { and, eq } from "drizzle-orm";
+import { getSignedCookie, setSignedCookie } from "hono/cookie";
+import { logger } from "hono/logger";
+import { serveStatic } from "hono/bun";
 
-const app = new Hono()
-const db = drizzle("./vote.db")
+const app = new Hono();
+const db = drizzle("./vote.db");
+const cookieSecret = process.env.COOKIE_SECRET ||
+  (typeof Bun !== "undefined" ? Bun.env.COOKIE_SECRET : "") ||
+  (() => {
+    throw new Error("COOKIE_SECRET is not set");
+  })();
 
-app.use(logger())
-app.use('/script.js', serveStatic({ path: './src/script.js' }))
-app.use("*", jsxRenderer(({ children }) => {
-  return (
-    <html>
-      <header>
-        <meta charSet="UTF-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>Vote</title>
-      </header>
-      <body>
-        {children}
-      </body>
-    </html>
-  )
-}))
+app.use(logger());
+app.use("/script.js", serveStatic({ path: "./src/script.js" }));
+app.use(
+  "*",
+  jsxRenderer(({ children }) => {
+    return (
+      <html>
+        <header>
+          <meta charSet="UTF-8" />
+          <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1.0"
+          />
+          <title>Vote</title>
+        </header>
+        <body>
+          {children}
+        </body>
+      </html>
+    );
+  }),
+);
 
 // 安定したヘッダーのみを使ってサーバー側フィンガープリントを計算（CF-Rayなど毎回変わる値は除外）
 const buildServerFingerprint = (req: Request) => {
-  const headers = req.headers
-  const ip = (headers.get("cf-connecting-ip") || headers.get("x-forwarded-for") || "").split(",")[0]?.trim()
-  const country = headers.get("cf-ipcountry") || ""
-  const ua = headers.get("user-agent") || ""
-  const lang = headers.get("accept-language") || ""
+  const headers = req.headers;
+  const ip =
+    (headers.get("cf-connecting-ip") || headers.get("x-forwarded-for") || "")
+      .split(",")[0]?.trim();
+  const country = headers.get("cf-ipcountry") || "";
+  const ua = headers.get("user-agent") || "";
+  const lang = headers.get("accept-language") || "";
 
-  const payload = JSON.stringify({ ip, country, ua, lang })
-  return createHash("sha256").update(payload).digest("hex")
-}
+  const payload = JSON.stringify({ ip, country, ua, lang });
+  return createHash("sha256").update(payload).digest("hex");
+};
 
 // クライアント側フィンガープリントをハッシュ化
 const hashClientFingerprint = (clientFp: string) => {
-  return createHash("sha256").update(clientFp).digest("hex")
-}
+  return createHash("sha256").update(clientFp).digest("hex");
+};
 
 // ホームページ（UIとクライアント側スクリプト）
-app.get('/', (c) => {
+app.get("/", (c) => {
   return c.html(`
     <!DOCTYPE html>
     <html lang="ja">
@@ -120,106 +133,117 @@ app.get('/', (c) => {
       <script defer src="/script.js"></script>
     </body>
     </html>
-  `)
-})
+  `);
+});
 
 // 初期化エンドポイント: クライアントフィンガープリント受け取り、セッション情報を返す
-app.post('/init', async (c) => {
+app.post("/init", async (c) => {
   try {
-    const body = await c.req.json()
-    const clientFp = body.clientFingerprint
+    if (!cookieSecret) {
+      return c.json({ message: "COOKIE_SECRET is not set" }, 500);
+    }
+    const body = await c.req.json();
+    const clientFp = body.clientFingerprint;
     if (!clientFp) {
-      return c.json({ message: 'clientFingerprint required' }, 400)
+      return c.json({ message: "clientFingerprint required" }, 400);
     }
 
-    const serverFp = buildServerFingerprint(c.req.raw)
-    const hashedClientFp = hashClientFingerprint(clientFp)
+    const serverFp = buildServerFingerprint(c.req.raw);
+    const hashedClientFp = hashClientFingerprint(clientFp);
 
     // 同じサーバーFPとクライアントFP両方の組み合わせが既に存在するかチェック
     const existingUser = await db.select().from(s.user).where(
       and(
         eq(s.user.serverFingerprint, serverFp),
-        eq(s.user.clientFingerprint, hashedClientFp)
-      )
-    ).limit(1)
+        eq(s.user.clientFingerprint, hashedClientFp),
+      ),
+    ).limit(1);
 
     if (existingUser.length > 0) {
       // 初期化済み：fingerプリントのみCookieに保存
-      setCookie(c, 'serverFp', serverFp, { 
+      await setSignedCookie(c, "serverFp", serverFp, cookieSecret, {
         maxAge: 24 * 60 * 60,
         secure: false,
-        sameSite: 'Lax'
-      })
-      setCookie(c, 'clientFp', hashedClientFp, { 
+        sameSite: "Lax",
+      });
+      await setSignedCookie(c, "clientFp", hashedClientFp, cookieSecret, {
         maxAge: 24 * 60 * 60,
         secure: false,
-        sameSite: 'Lax'
-      })
+        sameSite: "Lax",
+      });
 
       return c.json({
         initialized: true,
-        message: '初期化済みです'
-      })
+        message: "初期化済みです",
+      });
     }
 
     // 新規ユーザー：fingerプリントのみCookieに保存
-    setCookie(c, 'serverFp', serverFp, { 
+    await setSignedCookie(c, "serverFp", serverFp, cookieSecret, {
       maxAge: 24 * 60 * 60,
       secure: false,
-      sameSite: 'Lax'
-    })
-    setCookie(c, 'clientFp', hashedClientFp, { 
+      sameSite: "Lax",
+    });
+    await setSignedCookie(c, "clientFp", hashedClientFp, cookieSecret, {
       maxAge: 24 * 60 * 60,
       secure: false,
-      sameSite: 'Lax'
-    })
+      sameSite: "Lax",
+    });
 
     return c.json({
-      initialized: false
-    })
+      initialized: false,
+    });
   } catch (e) {
-    console.error('Init error:', e)
-    return c.json({ message: 'Internal error' }, 500)
+    console.error("Init error:", e);
+    return c.json({ message: "Internal error" }, 500);
   }
-})
+});
 
 // 投票エンドポイント: Cookieを検証して投票を受け付ける
-app.post('/vote', async (c) => {
+app.post("/vote", async (c) => {
   try {
-    const body = await c.req.json()
-    const voteOption = body.voteOption
+    if (!cookieSecret) {
+      return c.json({ message: "COOKIE_SECRET is not set" }, 500);
+    }
+    const body = await c.req.json();
+    const voteOption = body.voteOption;
     if (!voteOption) {
-      return c.json({ message: 'voteOption required' }, 400)
+      return c.json({ message: "voteOption required" }, 400);
     }
 
     // Cookieからフィンガープリントを取得
-    const cookieServerFp = getCookie(c, 'serverFp')
-    const cookieClientFp = getCookie(c, 'clientFp')
+    const cookieServerFp = await getSignedCookie(c, cookieSecret, "serverFp");
+    const cookieClientFp = await getSignedCookie(c, cookieSecret, "clientFp");
+
+    console.log(cookieServerFp, cookieClientFp);
 
     if (!cookieServerFp || !cookieClientFp) {
-      return c.json({ message: '未初期化です。先に初期化してください' }, 401)
+      return c.json({ message: "未初期化です。先に初期化してください" }, 401);
     }
 
     // 現在のリクエストのサーバーFPと比較（同じIP/User-Agentなどか確認）
-    const currentServerFp = buildServerFingerprint(c.req.raw)
+    const currentServerFp = buildServerFingerprint(c.req.raw);
     if (currentServerFp !== cookieServerFp) {
-      return c.json({ message: '異なる環境からのアクセスが検出されました' }, 403)
+      return c.json(
+        { message: "異なる環境からのアクセスが検出されました" },
+        403,
+      );
     }
 
     // DB内でフィンガープリントを使ってユーザーを検索
     const existingVote = await db.select().from(s.user).where(
       and(
         eq(s.user.serverFingerprint, cookieServerFp),
-        eq(s.user.clientFingerprint, cookieClientFp)
-      )
-    ).limit(1)
+        eq(s.user.clientFingerprint, cookieClientFp),
+      ),
+    ).limit(1);
 
     if (existingVote.length > 0 && existingVote[0].vote) {
-      return c.json({ message: '既に投票済みです' }, 409)
+      return c.json({ message: "既に投票済みです" }, 409);
     }
 
     // 投票を保存
-    const now = new Date()
+    const now = new Date();
     if (existingVote.length > 0) {
       // 更新
       await db.update(s.user)
@@ -227,64 +251,67 @@ app.post('/vote', async (c) => {
         .where(
           and(
             eq(s.user.serverFingerprint, cookieServerFp),
-            eq(s.user.clientFingerprint, cookieClientFp)
-          )
-        )
+            eq(s.user.clientFingerprint, cookieClientFp),
+          ),
+        );
     } else {
       // 新規作成
-      const userId = crypto.randomUUID()
+      const userId = crypto.randomUUID();
       await db.insert(s.user).values({
         id: userId,
         serverFingerprint: cookieServerFp,
         clientFingerprint: cookieClientFp,
         vote: voteOption,
-        createdAt: now
-      })
+        createdAt: now,
+      });
     }
 
-    return c.json({ message: '投票が完了しました：' + voteOption })
+    return c.json({ message: "投票が完了しました：" + voteOption });
   } catch (e) {
-    console.error('Vote error:', e)
-    return c.json({ message: 'Internal error' }, 500)
+    console.error("Vote error:", e);
+    return c.json({ message: "Internal error" }, 500);
   }
-})
+});
 
 // 投票状況確認エンドポイント
-app.get('/check-vote', async (c) => {
+app.get("/check-vote", async (c) => {
   try {
-    const cookieServerFp = getCookie(c, 'serverFp')
-    const cookieClientFp = getCookie(c, 'clientFp')
-    
+    if (!cookieSecret) {
+      return c.json({ hasVoted: false, vote: null }, 200);
+    }
+    const cookieServerFp = await getSignedCookie(c, cookieSecret, "serverFp");
+    const cookieClientFp = await getSignedCookie(c, cookieSecret, "clientFp");
+
     if (!cookieServerFp || !cookieClientFp) {
-      return c.json({ hasVoted: false, vote: null }, 200)
+      return c.json({ hasVoted: false, vote: null }, 200);
     }
 
     // 投票情報をDBからフィンガープリントで検索
     const voteRecord = await db.select().from(s.user).where(
       and(
         eq(s.user.serverFingerprint, cookieServerFp),
-        eq(s.user.clientFingerprint, cookieClientFp)
-      )
-    ).limit(1)
+        eq(s.user.clientFingerprint, cookieClientFp),
+      ),
+    ).limit(1);
 
     if (voteRecord.length > 0 && voteRecord[0].vote) {
       return c.json({
         hasVoted: true,
-        vote: voteRecord[0].vote
-      }, 200)
+        vote: voteRecord[0].vote,
+      }, 200);
     }
 
-    return c.json({ hasVoted: false, vote: null }, 200)
+    return c.json({ hasVoted: false, vote: null }, 200);
   } catch (e) {
-    console.error('Check vote error:', e)
-    return c.json({ hasVoted: false, vote: null }, 200)
+    console.error("Check vote error:", e);
+    return c.json({ hasVoted: false, vote: null }, 200);
   }
-})
+});
 
 // テスト用: サーバー側フィンガープリントを返す
-app.get('/server-fingerprint', (c) => {
-  const fingerprint = buildServerFingerprint(c.req.raw)
-  return c.json({ fingerprint })
-})
+app.get("/server-fingerprint", (c) => {
+  const fingerprint = buildServerFingerprint(c.req.raw);
+  return c.json({ fingerprint });
+});
 
-export default app
+export default app;
